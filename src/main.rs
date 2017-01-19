@@ -62,22 +62,21 @@ fn main() {
     let server = sock.incoming().for_each(|(conn, _)| {
         let handshaken_stream = acceptor.accept_async(conn);
         
-        let addr = "127.0.0.1:8059".parse().unwrap();
-        let subconnector = TcpStream::connect(&addr, &handle);
-        
-        let do_stuff = handshaken_stream.map_err(|e| io::Error::new(ErrorKind::Other, e)).and_then(|tls_stream| {
+        let local_handle = handle.clone(); // This clone gets consumed by the tls_stream-handling closure
+        let do_stuff = handshaken_stream.map_err(|e| io::Error::new(ErrorKind::Other, e)).and_then(move |tls_stream| {
             println!("We have tls_stream");
             
+            let addr = "127.0.0.1:8059".parse().unwrap();
+            let subconnector = TcpStream::connect(&addr, &local_handle);
             let handle_conn = subconnector.and_then(|subconn| {
                 println!("Got subconn");
                 bipipe(tls_stream, subconn)
             });
             
-            // Spawn expects things that return Item=(), Error=(), so consume them
-            
             handle_conn
         });
         
+        // Spawn expects things that return Item=(), Error=(), so consume them
         let do_stuff = do_stuff.map(|_| println!("got to end of the conn future!")).map_err(|e| println!("Got error! {:?}", e));
         
         // Spawn the future as a concurrent task
