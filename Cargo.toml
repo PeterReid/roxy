@@ -1,0 +1,10 @@
+[package]
+name = "tls_user"
+version = "0.1.0"
+authors = ["Peter Reid <peter.d.reid@gmail.com>"]
+
+[dependencies]
+native-tls = "0.1.1"
+tokio-tls = "0.1.0"
+tokio-core = "0.1.0"
+futures = "0.1.8"
