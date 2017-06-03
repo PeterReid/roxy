@@ -1,9 +1,14 @@
 extern crate futures;
 extern crate tokio_tls;
+extern crate tokio_io;
 extern crate native_tls;
+extern crate notify;
 extern crate byteorder;
 #[macro_use] extern crate tokio_core;
+extern crate json;
+extern crate url;
 
+mod config;
 mod copy_and_yield;
 mod closable;
 mod prefixed_writer;
@@ -19,10 +24,11 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::Core;
-use tokio_core::io::read_exact;
+use tokio_io::io::read_exact;
 //use std::sync::Arc;
 use std::rc::Rc;
 use byteorder::{BigEndian, ByteOrder};
+use config::Config;
 
 /*
 struct HostReader<R> {
@@ -120,7 +126,9 @@ fn get_host(handshake: &[u8]) -> Result<String, ()> {
 }
 
 fn main() {
-    let mut file = File::open("identity.pfx").unwrap();
+    let config = Config::new("config.json").expect("Config setup failed");
+    
+    let mut file = File::open("flightvector.pfx").unwrap();
     let mut pkcs12 = vec![];
     file.read_to_end(&mut pkcs12).unwrap();
     let pkcs12 = Pkcs12::from_der(&pkcs12, "").unwrap();

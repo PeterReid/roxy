@@ -5,7 +5,11 @@ authors = ["Peter Reid <peter.d.reid@gmail.com>"]
 
 [dependencies]
 native-tls = "0.1.1"
-tokio-tls = "0.1.0"
-tokio-core = "0.1.0"
-futures = "0.1.8"
+tokio-tls = "0.1.2"
+tokio-core = "0.1.7"
+tokio-io = "*"
+futures = "0.1.14"
 byteorder = "1.0.0"
+notify = "4.0.0"
+json = "0.11.6"
+url = "1.4.1"
