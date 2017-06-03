@@ -16,6 +16,8 @@ use std::io::Read;
 use std::fs::File;
 use url::Url;
 use native_tls::{Pkcs12,};
+use futures::sink::Sink;
+use tokio_core::reactor::Core;
 
 type Port = u16;
 
@@ -62,7 +64,7 @@ fn parse_target(target: &str) -> Result<(SocketAddr, bool), String> {
     Ok((dest, secure))
 }
 
-fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), String> {
+fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx: FutureSender<BTreeSet<Port>>) -> Result<(), String> {
     let mut bytes = Vec::new();
     
     File::open(path).unwrap().read_to_end(&mut bytes).unwrap();
@@ -75,6 +77,8 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), 
     };
     
     let mut inputs = HashMap::new();
+
+    let mut listen_ports = BTreeSet::new();
     
     for (incoming_url_str, value) in json_ob.iter() {
         
@@ -89,11 +93,14 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), 
         };
         
         let hostname = incoming_url.host_str().ok_or_else(|| format!("Missing host in {:?}", incoming_url_str))?;
+        let port = incoming_url.port().unwrap_or(if secure { 443 } else { 80 });
         let input = Input {
             host: hostname.to_string(),
             secure: secure,
-            port: incoming_url.port().unwrap_or(if secure { 443 } else { 80 })
+            port: port
         };
+        
+        listen_ports.insert(port);
         
         println!("{:?}", input);
         if let JsonValue::Object(ref value) = *value {
@@ -123,11 +130,18 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), 
                       println!("Confused by output");
                   }
             }
-//            println!("{:?} {:?} {:?} {:?} {:?}", incoming_url.scheme(), incoming_url.host_str(), incoming_url.port(), cert, target);
         }
     }
 
     *data.lock().expect("config lock failed")= inputs;
+    
+    
+    
+    
+ 
+    let mut core = Core::new().map_err(|e| format!("Internal error: Unable to initialize Core for port configuration send: {:?}", e))?;
+    core.run(port_config_tx.send(listen_ports)).map_err(|e| format!("Internal error running port configuration send: {:?}", e))?;
+    
     
     Ok( () )
 }
@@ -144,16 +158,15 @@ fn run_watcher(path: PathBuf, data: Arc<Mutex<HashMap<Input, Output>>>, port_con
     let mut watcher = notify::watcher(tx, Duration::from_millis(500)).map_err(|_| ConfigError::UnableToWatchFiles)?;
     watcher.watch(&path, RecursiveMode::NonRecursive).map_err(|_| ConfigError::ConfigFileNotFound)?;
     println!("Initial config load");
-    log_error(load_config(&path, &data));
+    log_error(load_config(&path, &data, port_config_tx.clone()));
     
     loop {
         
         if let DebouncedEvent ::Write(_) = rx.recv().map_err(|_| ConfigError::WatchEnded)? {
             println!("Loading config");
-            log_error(load_config(&path, &data));
+            log_error(load_config(&path, &data, port_config_tx.clone()));
         }
     }
-
 }
 
 impl Config {

@@ -130,6 +130,11 @@ fn main() {
     let addr = "0.0.0.0:8443".parse().unwrap();
     let sock: TcpListener = TcpListener::bind(&addr, &handle).unwrap();
     
+    let interpret_port_settings = port_settings.for_each(|setting| {
+        println!("port settings: {:?}", setting);
+        Ok( () )
+    });
+    
     let server = sock.incoming().for_each(move |(conn, _)| {
         let config = config.clone();
         
@@ -187,9 +192,11 @@ fn main() {
         Ok(())
     });
     
+    let all = server.map_err(|e| println!("server failed: {:?}", e))
+        .join(interpret_port_settings.map_err(|e| println!("interpret_port_settings failed: {:?}", e)));
     
     // Spin up the server on the event loop
-    core.run(server).unwrap();
+    core.run(all).unwrap();
     
     /*
     
