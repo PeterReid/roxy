@@ -19,12 +19,20 @@ use prefixed_writer::PrefixedWriter;
 use futures::{Future, Stream};
 
 use tokio_tls::{TlsAcceptorExt};
+use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
+use std::collections::HashMap;
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::Core;
+use tokio_core::reactor::Handle;
 use tokio_io::io::read_exact;
 use byteorder::{BigEndian, ByteOrder};
 use config::{Config, Input};
+use std::cell::RefCell;
+use futures::future;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 
 /*
 struct HostReader<R> {
@@ -121,104 +129,142 @@ fn get_host(handshake: &[u8]) -> Result<String, ()> {
     Err( () )
 }
 
+struct PortStatus {
+    
+
+}
+
+struct ServerStatus {
+    config: Config,
+    handle: Handle,
+    ports: HashMap<u16, PortStatus>
+}
+
+impl ServerStatus {
+    fn new(config: Config, handle: Handle) -> ServerStatus {
+        ServerStatus {
+            ports: HashMap::new(),
+            config: config,
+            handle: handle,
+        }
+    }
+    
+    fn run_server_on_port(&self, port: u16) -> Result<Box<Future<Item=(), Error=()>>, io::Error> {
+        println!("Going to run server on port {}", port);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
+        let handle = self.handle.clone();
+        let config = self.config.clone();
+        
+        let sock: TcpListener = TcpListener::bind(&addr, &handle)?;
+        let server = sock.incoming().for_each(move |(conn, incoming_addr)| {
+            println!("Incoming connection from {:?}", incoming_addr);
+            let config = config.clone();
+            
+            //let snied_stream = conn;//detect_hostname(conn);
+            let f = read_exact(conn, [0u8; 5]);
+            let snied_stream = f.and_then(|(x, handshake_header)| {
+                let handshake_len = BigEndian::read_u16(&handshake_header[3..5]) as usize;
+
+                read_exact(x, vec![0u8; handshake_len]).map(move |(x, handshake_content)| {
+                    let mut both = vec![0u8; handshake_len + 5];
+                    both[0..5].copy_from_slice(&handshake_header[..]);;
+                    both[5..].copy_from_slice(&handshake_content[..]);
+                    
+                    let res = match get_host(&handshake_content[..]) {
+                        Ok(host) => host,
+                        Err( () ) => String::new(),
+                    };
+                    (res, PrefixedWriter::new(x, both.into_boxed_slice()))
+                })
+            });
+            
+            let handshaken_stream = snied_stream.and_then(move |(host, conn)| {
+                println!("Host is {}", host);
+                let input = Input{
+                    secure: true,
+                    port: 8443,
+                    host: host
+                };
+                println!("Lookingn for input: {:?}", input);
+                let output = config.get(&input).expect("Configuration for input not found");
+                
+                assert!(!output.secure);
+                (output.acceptor.accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.address))
+            });
+            
+            let local_handle = handle.clone(); // This clone gets consumed by the tls_stream-handling closure
+            let do_stuff = handshaken_stream.and_then(move |(tls_stream, address)| {
+                println!("We have tls_stream");
+                
+                let subconnector = TcpStream::connect(&address, &local_handle);
+                let handle_conn = subconnector.and_then(|subconn| {
+                    println!("Got subconn");
+                    bipipe(tls_stream, subconn)
+                });
+                
+                handle_conn
+            });
+            
+            // Spawn expects things that return Item=(), Error=(), so consume them
+            let do_stuff = do_stuff.map(|_| println!("got to end of the conn future!")).map_err(|e| println!("Got error! {:?}", e));
+            
+            // Spawn the future as a concurrent task
+            handle.spawn(do_stuff);
+        
+            Ok(())
+        });
+        
+        Ok(Box::new(server.map_err(|e| println!("Error running server: {:?}", e))))
+    }
+    
+    fn listen_on(&mut self, goal_ports: &BTreeSet<u16>) -> Box<Future<Item=(), Error=()>> {
+        let mut do_all: Box<Future<Item=(), Error=()>> = Box::new(future::ok( () ));
+        
+        for goal_port in goal_ports.iter() {
+            if !self.ports.contains_key(goal_port) {
+                println!("We'd better start listening to {}", goal_port);
+                let x = PortStatus {};
+                
+                match self.run_server_on_port(*goal_port) {
+                    Ok(run) => {
+                        do_all = Box::new(do_all.join(run).map(|((), ())| ()));
+                        self.ports.insert(*goal_port, x);
+                    }
+                    Err(e) => {
+                        println!("Failed to listen on port {}: {:?}", goal_port, e);
+                    }
+                }
+            }
+        }
+        
+        for (port, status) in self.ports.iter_mut() {
+            if !goal_ports.contains(port) {
+                println!("Time to shut down {}", port);
+            } 
+        }
+        
+        do_all
+    }
+    
+}
+
+
+
 fn main() {
     let (config, port_settings) = Config::new("config.json").expect("Config setup failed");
     
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     
-    let addr = "0.0.0.0:8443".parse().unwrap();
-    let sock: TcpListener = TcpListener::bind(&addr, &handle).unwrap();
+    let port_statuses = RefCell::new(ServerStatus::new(config.clone(), handle.clone()));
     
     let interpret_port_settings = port_settings.for_each(|setting| {
         println!("port settings: {:?}", setting);
-        Ok( () )
+        
+        port_statuses.borrow_mut().listen_on(&setting)
+        
     });
-    
-    let server = sock.incoming().for_each(move |(conn, _)| {
-        let config = config.clone();
-        
-        //let snied_stream = conn;//detect_hostname(conn);
-        let f = read_exact(conn, [0u8; 5]);
-        let snied_stream = f.and_then(|(x, handshake_header)| {
-            let handshake_len = BigEndian::read_u16(&handshake_header[3..5]) as usize;
-
-            read_exact(x, vec![0u8; handshake_len]).map(move |(x, handshake_content)| {
-                let mut both = vec![0u8; handshake_len + 5];
-                both[0..5].copy_from_slice(&handshake_header[..]);;
-                both[5..].copy_from_slice(&handshake_content[..]);
-                
-                let res = match get_host(&handshake_content[..]) {
-                    Ok(host) => host,
-                    Err( () ) => String::new(),
-                };
-                (res, PrefixedWriter::new(x, both.into_boxed_slice()))
-            })
-        });
-        
-        let handshaken_stream = snied_stream.and_then(move |(host, conn)| {
-            println!("Host is {}", host);
-            let input = Input{
-                secure: true,
-                port: 8443,
-                host: host
-            };
-            println!("Lookingn for input: {:?}", input);
-            let output = config.get(&input).expect("Configuration for input not found");
-            
-            assert!(!output.secure);
-            (output.acceptor.accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.address))
-        });
-        
-        let local_handle = handle.clone(); // This clone gets consumed by the tls_stream-handling closure
-        let do_stuff = handshaken_stream.and_then(move |(tls_stream, address)| {
-            println!("We have tls_stream");
-            
-            let subconnector = TcpStream::connect(&address, &local_handle);
-            let handle_conn = subconnector.and_then(|subconn| {
-                println!("Got subconn");
-                bipipe(tls_stream, subconn)
-            });
-            
-            handle_conn
-        });
-        
-        // Spawn expects things that return Item=(), Error=(), so consume them
-        let do_stuff = do_stuff.map(|_| println!("got to end of the conn future!")).map_err(|e| println!("Got error! {:?}", e));
-        
-        // Spawn the future as a concurrent task
-        handle.spawn(do_stuff);
-    
-        Ok(())
-    });
-    
-    let all = server.map_err(|e| println!("server failed: {:?}", e))
-        .join(interpret_port_settings.map_err(|e| println!("interpret_port_settings failed: {:?}", e)));
     
     // Spin up the server on the event loop
-    core.run(all).unwrap();
-    
-    /*
-    
-    fn handle_client(mut stream: TlsStream<TcpStream>) {
-        println!("Handling client");
-        //let mut xs = vec![];
-        //stream.read_to_end(&mut xs).expect("read_to_end failed");
-        stream.write_all(
-          b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length:4\r\n\r\nHere\r\n").expect("write_all failed");
-
-    }
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let acceptor = acceptor.clone();
-                thread::spawn(move || {
-                    let stream = acceptor.accept(stream).unwrap();
-                    handle_client(stream);
-                });
-            }
-            Err(e) => { panic!("connection failed {:?}", e) /* connection failed */ }
-        }
-    }*/
+    core.run(interpret_port_settings.map_err(|e| println!("interpret_port_settings failed: {:?}", e))).unwrap();
 }
