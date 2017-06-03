@@ -1,7 +1,6 @@
 use std::io::{self, Read, Write};
 use futures::{Future, Poll, Async};
-use closable::Closable;
-use tokio_core::io::Io;
+use tokio_io::{AsyncRead, AsyncWrite};
 
 struct StreamState {
     read_done: bool,
@@ -20,7 +19,7 @@ impl StreamState {
         }
     }
     
-    fn pump<A: Read, B: Write+Closable>(&mut self, from: &mut A, to: &mut B) -> Poll<(), io::Error> {
+    fn pump<A: Read, B: Write+AsyncWrite>(&mut self, from: &mut A, to: &mut B) -> Poll<(), io::Error> {
         loop {
             // If our buffer is empty, then we need to read some data to
             // continue.
@@ -59,8 +58,8 @@ pub struct BiPipe<A, B> {
 }
 
 pub fn bipipe<A, B>(a: A, b: B) -> BiPipe<A, B>
-    where A: Io + Closable,
-          B: Io + Closable,
+    where A: AsyncRead + AsyncWrite,
+          B: AsyncRead + AsyncWrite,
 {
     BiPipe {
         a: a,
@@ -71,18 +70,18 @@ pub fn bipipe<A, B>(a: A, b: B) -> BiPipe<A, B>
 }
 
 
-impl<A: Closable, B: Closable> BiPipe<A, B> {
+impl<A: AsyncWrite, B: AsyncWrite> BiPipe<A, B> {
     
     fn close_both(&mut self) {
-        self.a.close();
-        self.b.close();
+        self.a.shutdown();
+        self.b.shutdown();
     }
     
 }
 
 impl<A, B> Future for BiPipe<A, B>
-    where A: Io + Closable,
-          B: Io + Closable,
+    where A: AsyncRead + AsyncWrite,
+          B: AsyncRead + AsyncWrite,
 {
     type Item = ();
     type Error = io::Error;

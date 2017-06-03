@@ -1,7 +1,8 @@
-use tokio_core::io::Io;
-use futures::Async;
+use futures::{Poll};
 use std::io::{self, Read, Write};
 use std::cmp::min;
+use tokio_io::{AsyncRead, AsyncWrite};
+use bytes::Buf;
 
 pub struct PrefixedWriter<S> {
     inner: S,
@@ -24,17 +25,17 @@ impl<S> PrefixedWriter<S> {
     }
 }
 
-impl<S: Io> Io for PrefixedWriter<S> {
-    fn poll_read(&mut self) -> Async<()> {
-        if self.prefix.is_none() {
-            self.inner.poll_read()
-        } else {
-            Async::Ready( () )
-        }
+impl<S: Read> AsyncRead for PrefixedWriter<S> {
+}
+
+
+impl<S: AsyncWrite> AsyncWrite for PrefixedWriter<S> {
+    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+        self.inner.write_buf(buf)
     }
     
-    fn poll_write(&mut self) -> Async<()> {
-        self.inner.poll_write()
+    fn shutdown(&mut self) -> Poll<(), io::Error> {
+        self.inner.shutdown()
     }
 }
 

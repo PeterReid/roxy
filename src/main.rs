@@ -7,10 +7,10 @@ extern crate byteorder;
 #[macro_use] extern crate tokio_core;
 extern crate json;
 extern crate url;
+extern crate bytes;
 
 mod config;
 mod copy_and_yield;
-mod closable;
 mod prefixed_writer;
 
 use copy_and_yield::bipipe;
