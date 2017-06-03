@@ -18,6 +18,7 @@ use prefixed_writer::PrefixedWriter;
 
 use futures::{Future, Stream};
 
+use futures::sync::oneshot;
 use tokio_tls::{TlsAcceptorExt};
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
@@ -29,7 +30,6 @@ use tokio_io::io::read_exact;
 use byteorder::{BigEndian, ByteOrder};
 use config::{Config, Input};
 use std::cell::RefCell;
-use futures::future;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
@@ -131,7 +131,7 @@ fn get_host(handshake: &[u8]) -> Result<String, ()> {
 
 struct PortStatus {
     
-
+    shutdown: oneshot::Sender<()>
 }
 
 struct ServerStatus {
@@ -149,7 +149,7 @@ impl ServerStatus {
         }
     }
     
-    fn run_server_on_port(&self, port: u16) -> Result<Box<Future<Item=(), Error=()>>, io::Error> {
+    fn run_server_on_port(&self, port: u16, shutdown_rx: oneshot::Receiver<()>) -> Result<(), io::Error> {
         println!("Going to run server on port {}", port);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
         let handle = self.handle.clone();
@@ -182,7 +182,7 @@ impl ServerStatus {
                 println!("Host is {}", host);
                 let input = Input{
                     secure: true,
-                    port: 8443,
+                    port: port,
                     host: host
                 };
                 println!("Lookingn for input: {:?}", input);
@@ -214,20 +214,31 @@ impl ServerStatus {
             Ok(())
         });
         
-        Ok(Box::new(server.map_err(|e| println!("Error running server: {:?}", e))))
+        let server = server.map_err(|e| {
+            println!("Error running server on port: {:?}", e);
+        });
+        
+        let shutdown_rx = shutdown_rx.map_err(|_| ()).map(|_| ());
+        
+        let server_or_shut_down = server.select(shutdown_rx).map(|((), _)| ()).map_err(|((),_)| ());
+        
+        self.handle.spawn(server_or_shut_down);
+        
+        Ok( () )
     }
     
-    fn listen_on(&mut self, goal_ports: &BTreeSet<u16>) -> Box<Future<Item=(), Error=()>> {
-        let mut do_all: Box<Future<Item=(), Error=()>> = Box::new(future::ok( () ));
-        
+    fn listen_on(&mut self, goal_ports: &BTreeSet<u16>) {
         for goal_port in goal_ports.iter() {
             if !self.ports.contains_key(goal_port) {
                 println!("We'd better start listening to {}", goal_port);
-                let x = PortStatus {};
                 
-                match self.run_server_on_port(*goal_port) {
-                    Ok(run) => {
-                        do_all = Box::new(do_all.join(run).map(|((), ())| ()));
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                let x = PortStatus {
+                    shutdown: shutdown_tx
+                };
+                
+                match self.run_server_on_port(*goal_port, shutdown_rx) {
+                    Ok( () ) => {
                         self.ports.insert(*goal_port, x);
                     }
                     Err(e) => {
@@ -237,13 +248,20 @@ impl ServerStatus {
             }
         }
         
-        for (port, status) in self.ports.iter_mut() {
+        let mut to_removes = Vec::new();
+        for (port, _) in self.ports.iter_mut() {
             if !goal_ports.contains(port) {
-                println!("Time to shut down {}", port);
+                to_removes.push(*port);
             } 
         }
         
-        do_all
+        for to_remove in to_removes {
+            println!("Shutting down listener for port {}", to_remove);
+            
+            if let Some(port_status) = self.ports.remove(&to_remove) {
+                let _ = port_status.shutdown.send( () );
+            }
+        }
     }
     
 }
@@ -261,8 +279,8 @@ fn main() {
     let interpret_port_settings = port_settings.for_each(|setting| {
         println!("port settings: {:?}", setting);
         
-        port_statuses.borrow_mut().listen_on(&setting)
-        
+        port_statuses.borrow_mut().listen_on(&setting);
+        Ok( () )
     });
     
     // Spin up the server on the event loop
