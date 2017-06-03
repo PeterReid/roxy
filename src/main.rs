@@ -34,40 +34,6 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 
-/*
-struct HostReader<R> {
-    inner: Option<HostReadResult<R>>
-}
-
-struct HostReadResult<R> {
-    read_prefix: Vec<u8>,
-    reader: R,
-}
-
-impl Future for HostReader {
-    type Item = HostReadResult;
-    type Error;
-
-    fn poll(&mut self) -> Poll<u64, io::Error> {
-        loop {
-            let n = try_nb!(self.reader.read(&mut self.buf));
-            if n == 0 {
-                self.read_done = true;
-            } else {
-                self.pos = 0;
-                self.cap = n;
-            }
-        }
-    }
-}*/
-
-//fn detect_hostname(x: TcpStream) -> DetectHostname {
-//    
-//}
-
-
-
-
 
 fn cut_prefix(xs: &[u8], cut: usize) -> Result<&[u8], ()> {
     if cut < xs.len() {
