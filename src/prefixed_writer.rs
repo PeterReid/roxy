@@ -4,6 +4,8 @@ use std::cmp::min;
 use tokio_io::{AsyncRead, AsyncWrite};
 use bytes::Buf;
 
+/// PrefixedWriter wraps a `Read`able object but prefixes the bytes read
+/// from it by some byte string.
 pub struct PrefixedWriter<S> {
     inner: S,
     prefix: Option<Box<[u8]>>,

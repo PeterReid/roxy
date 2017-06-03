@@ -57,6 +57,8 @@ pub struct BiPipe<A, B> {
     b_to_a: StreamState,
 }
 
+/// Connect two pipes together so that bytes fed into `a` are emitted from `b`
+/// and bytes fed into `b` are emitted from `a`.
 pub fn bipipe<A, B>(a: A, b: B) -> BiPipe<A, B>
     where A: AsyncRead + AsyncWrite,
           B: AsyncRead + AsyncWrite,
@@ -71,14 +73,12 @@ pub fn bipipe<A, B>(a: A, b: B) -> BiPipe<A, B>
 
 
 impl<A: AsyncWrite, B: AsyncWrite> BiPipe<A, B> {
-    
     fn close_both(&mut self) -> Poll<(), io::Error> {
         let err1 = self.a.shutdown();
         let err2 = self.b.shutdown();
         try!(err1);
         err2
     }
-    
 }
 
 impl<A, B> Future for BiPipe<A, B>
