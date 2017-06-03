@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 use native_tls::TlsAcceptor;
-use std::sync::RwLock;
-use tokio_core::reactor::Core;
 use std::sync::mpsc::{channel};
 use std::sync::{Arc, Mutex};
-use std::rc::Rc;
+use futures::sync::mpsc::Receiver as FutureReceiver;
+use futures::sync::mpsc::Sender as FutureSender;
+use futures::sync::mpsc::channel as future_channel;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use futures::{Future, Stream};
 use std::thread;
 use std::time::Duration;
 use notify::{self, Watcher, RecursiveMode, DebouncedEvent};
@@ -15,23 +15,25 @@ use json::{self, JsonValue};
 use std::io::Read;
 use std::fs::File;
 use url::Url;
+use native_tls::{Pkcs12,};
 
 type Port = u16;
 
 #[derive(Hash, Eq, PartialEq, Debug)]
-struct Input {
-    port: Port,
-    host: String,
-    secure: bool,
+pub struct Input {
+    pub port: Port,
+    pub host: String,
+    pub secure: bool,
 }
 
 #[derive(Clone)]
-struct Output {
-    acceptor: Arc<TlsAcceptor>,
-    port: Port,
-    output: SocketAddr,
+pub struct Output {
+    pub acceptor: Arc<TlsAcceptor>,
+    pub address: SocketAddr,
+    pub secure: bool,
 }
 
+#[derive(Clone)]
 pub struct Config {
     inner: Arc<Mutex<HashMap<Input, Output>>>
 }
@@ -43,6 +45,22 @@ pub enum ConfigError {
     WatchEnded,
 }
 
+fn parse_target(target: &str) -> Result<(SocketAddr, bool), String> {
+    let divider = target.find("://").ok_or_else(|| format!("Missing scheme specifier such as http:// in {:?}", target))?;
+    let (scheme, addr) = target.split_at(divider+3);
+    
+    let secure = match scheme {
+        "http://" => false,
+        "https://" => true,
+        _ => {
+            return Err(format!("Invalid scheme ({:?}) in {:?}", scheme, target));
+        }
+    };
+    
+    let dest = addr.parse().map_err(|_| format!("Malformed IP/port in {:?}", target))?;
+    
+    Ok((dest, secure))
+}
 
 fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), String> {
     let mut bytes = Vec::new();
@@ -60,7 +78,7 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), 
     
     for (incoming_url_str, value) in json_ob.iter() {
         
-        let incoming_url = Url::parse(incoming_url_str).map_err(|e| format!("Badly formatted host: {}", incoming_url_str))?;
+        let incoming_url = Url::parse(incoming_url_str).map_err(|e| format!("Badly formatted host: {}\n{:?}", incoming_url_str, e))?;
         
         let secure = match incoming_url.scheme() {
             "http" => false,
@@ -79,11 +97,32 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), 
         
         println!("{:?}", input);
         if let JsonValue::Object(ref value) = *value {
-            let cert = value.get("cert").and_then(|x| x.as_str());
+            let pfx = value.get("pfx").and_then(|x| x.as_str());
             let target = value.get("target").and_then(|x| x.as_str());
-            let _redirect = value.get("target").and_then(|x| x.as_str());
+            let redirect = value.get("redirect").and_then(|x| x.as_str());
+  
+            match (pfx, target, redirect) {
+                  (Some(pfx), Some(target), None) => {
+                      let (address, secure) = parse_target(target).unwrap();
             
-            
+                      let mut file = File::open(pfx).unwrap();
+                      let mut pkcs12 = vec![];
+                      file.read_to_end(&mut pkcs12).unwrap();
+                      let pkcs12 = Pkcs12::from_der(&pkcs12, "").unwrap();
+                      let acceptor = TlsAcceptor::builder(pkcs12).unwrap().build().unwrap();
+
+                      let output = Output{
+                          acceptor: Arc::new(acceptor),
+                          address: address,
+                          secure: secure,
+                      };
+                      
+                      inputs.insert(input, output);
+                  },
+                  _ => {
+                      println!("Confused by output");
+                  }
+            }
 //            println!("{:?} {:?} {:?} {:?} {:?}", incoming_url.scheme(), incoming_url.host_str(), incoming_url.port(), cert, target);
         }
     }
@@ -93,31 +132,39 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>) -> Result<(), 
     Ok( () )
 }
 
-fn run_watcher(path: PathBuf, data: Arc<Mutex<HashMap<Input, Output>>>) -> Result<(), ConfigError> {
+fn log_error(res: Result<(), String>) {
+    if let Err(e) = res {
+        println!("Error: {}", e);
+    }
+}
+
+fn run_watcher(path: PathBuf, data: Arc<Mutex<HashMap<Input, Output>>>, port_config_tx: FutureSender<BTreeSet<Port>>) -> Result<(), ConfigError> {
     let (tx, rx) = channel();
         
     let mut watcher = notify::watcher(tx, Duration::from_millis(500)).map_err(|_| ConfigError::UnableToWatchFiles)?;
     watcher.watch(&path, RecursiveMode::NonRecursive).map_err(|_| ConfigError::ConfigFileNotFound)?;
     println!("Initial config load");
-    load_config(&path, &data);
+    log_error(load_config(&path, &data));
     
     loop {
         
-        if let DebouncedEvent ::Write(_) = rx.recv().map_err(|e| ConfigError::WatchEnded)? {
+        if let DebouncedEvent ::Write(_) = rx.recv().map_err(|_| ConfigError::WatchEnded)? {
             println!("Loading config");
-            load_config(&path, &data);
+            log_error(load_config(&path, &data));
         }
     }
 
 }
 
 impl Config {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<(Config, FutureReceiver<BTreeSet<Port>>), ConfigError> {
         let path = path.as_ref().to_path_buf();
         let inner = Arc::new(Mutex::new(HashMap::new()));
         let inner_for_watcher = inner.clone();
+        let (port_config_tx, port_config_rx) = future_channel(1); 
         thread::spawn(move || {
-            match run_watcher(path, inner_for_watcher) {
+            
+            match run_watcher(path, inner_for_watcher, port_config_tx) {
                 Ok( () ) => {},
                 Err( e ) => {
                     println!("config watcher ended: {:?}", e);
@@ -125,9 +172,9 @@ impl Config {
             }
         });
         
-        Ok(Config{
+        Ok((Config{
             inner: inner
-        })
+        }, port_config_rx))
     }
     
     pub fn get(&self, input: &Input) -> Option<Output> {

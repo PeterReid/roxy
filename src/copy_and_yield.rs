@@ -72,9 +72,11 @@ pub fn bipipe<A, B>(a: A, b: B) -> BiPipe<A, B>
 
 impl<A: AsyncWrite, B: AsyncWrite> BiPipe<A, B> {
     
-    fn close_both(&mut self) {
-        self.a.shutdown();
-        self.b.shutdown();
+    fn close_both(&mut self) -> Poll<(), io::Error> {
+        let err1 = self.a.shutdown();
+        let err2 = self.b.shutdown();
+        try!(err1);
+        err2
     }
     
 }
@@ -89,11 +91,11 @@ impl<A, B> Future for BiPipe<A, B>
     fn poll(&mut self) -> Poll<(), io::Error> {
         match self.a_to_b.pump(&mut self.a, &mut self.b) {
             Err(e) => {
-                self.close_both();
+                let _ = self.close_both();
                 return Err(e);
             },
             Ok(Async::Ready(())) => {
-                self.close_both();
+                self.close_both()?;
                 return Ok(Async::Ready(()))
             },
             Ok(Async::NotReady) => {
@@ -103,11 +105,11 @@ impl<A, B> Future for BiPipe<A, B>
         
         match self.b_to_a.pump(&mut self.b, &mut self.a) {
             Err(e) => {
-                self.close_both();
+                let _ = self.close_both();
                 return Err(e);
             },
             Ok(Async::Ready(())) => {
-                self.close_both();
+                self.close_both()?;
                 return Ok(Async::Ready(()))
             },
             Ok(Async::NotReady) => {

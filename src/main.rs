@@ -18,17 +18,13 @@ use prefixed_writer::PrefixedWriter;
 
 use futures::{Future, Stream};
 
-use native_tls::{Pkcs12, TlsAcceptor};
 use tokio_tls::{TlsAcceptorExt};
-use std::fs::File;
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind};
 use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::Core;
 use tokio_io::io::read_exact;
-//use std::sync::Arc;
-use std::rc::Rc;
 use byteorder::{BigEndian, ByteOrder};
-use config::Config;
+use config::{Config, Input};
 
 /*
 struct HostReader<R> {
@@ -126,23 +122,17 @@ fn get_host(handshake: &[u8]) -> Result<String, ()> {
 }
 
 fn main() {
-    let config = Config::new("config.json").expect("Config setup failed");
+    let (config, port_settings) = Config::new("config.json").expect("Config setup failed");
     
-    let mut file = File::open("flightvector.pfx").unwrap();
-    let mut pkcs12 = vec![];
-    file.read_to_end(&mut pkcs12).unwrap();
-    let pkcs12 = Pkcs12::from_der(&pkcs12, "").unwrap();
-
     let mut core = Core::new().unwrap();
     let handle = core.handle();
-    
-    let acceptor = TlsAcceptor::builder(pkcs12).unwrap().build().unwrap();
-    let acceptor = Rc::new(acceptor);
     
     let addr = "0.0.0.0:8443".parse().unwrap();
     let sock: TcpListener = TcpListener::bind(&addr, &handle).unwrap();
     
     let server = sock.incoming().for_each(move |(conn, _)| {
+        let config = config.clone();
+        
         //let snied_stream = conn;//detect_hostname(conn);
         let f = read_exact(conn, [0u8; 5]);
         let snied_stream = f.and_then(|(x, handshake_header)| {
@@ -161,18 +151,25 @@ fn main() {
             })
         });
         
-        let acceptor = acceptor.clone();
         let handshaken_stream = snied_stream.and_then(move |(host, conn)| {
             println!("Host is {}", host);
-            acceptor.accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e))
+            let input = Input{
+                secure: true,
+                port: 8443,
+                host: host
+            };
+            println!("Lookingn for input: {:?}", input);
+            let output = config.get(&input).expect("Configuration for input not found");
+            
+            assert!(!output.secure);
+            (output.acceptor.accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.address))
         });
         
         let local_handle = handle.clone(); // This clone gets consumed by the tls_stream-handling closure
-        let do_stuff = handshaken_stream.and_then(move |tls_stream| {
+        let do_stuff = handshaken_stream.and_then(move |(tls_stream, address)| {
             println!("We have tls_stream");
             
-            let addr = "127.0.0.1:8059".parse().unwrap();
-            let subconnector = TcpStream::connect(&addr, &local_handle);
+            let subconnector = TcpStream::connect(&address, &local_handle);
             let handle_conn = subconnector.and_then(|subconn| {
                 println!("Got subconn");
                 bipipe(tls_stream, subconn)
