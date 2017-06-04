@@ -28,13 +28,16 @@ use tokio_core::net::{TcpStream, TcpListener};
 use tokio_core::reactor::Core;
 use tokio_core::reactor::Handle;
 use tokio_io::io::read_exact;
+use tokio_io::io::read;
+use tokio_io::io::write_all;
+use std::str;
 use byteorder::{BigEndian, ByteOrder};
 use config::{Config, Input};
 use std::cell::RefCell;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-
+use std::rc::Rc;
 
 fn cut_prefix(xs: &[u8], cut: usize) -> Result<&[u8], ()> {
     if cut < xs.len() {
@@ -104,7 +107,8 @@ struct PortStatus {
 struct ServerStatus {
     config: Config,
     handle: Handle,
-    ports: HashMap<u16, PortStatus>
+    ports: HashMap<u16, PortStatus>,
+    source_address: Rc<RefCell<HashMap<u16, SocketAddr>>>,
 }
 
 fn looks_like_http(x: &[u8]) -> bool {
@@ -117,6 +121,7 @@ impl ServerStatus {
             ports: HashMap::new(),
             config: config,
             handle: handle,
+            source_address: Rc::new(RefCell::new(HashMap::new())),
         }
     }
     
@@ -125,9 +130,11 @@ impl ServerStatus {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
         let handle = self.handle.clone();
         let config = self.config.clone();
+        let source_address = self.source_address.clone();
         
         let sock: TcpListener = TcpListener::bind(&addr, &handle)?;
         let server = sock.incoming().for_each(move |(conn, incoming_addr)| {
+            let source_address = source_address.clone();
             println!("Incoming connection from {:?}", incoming_addr);
             let config = config.clone();
             
@@ -183,7 +190,11 @@ impl ServerStatus {
                         println!("We have tls_stream");
                         
                         let subconnector = TcpStream::connect(&address, &local_handle);
-                        let handle_conn = subconnector.and_then(|subconn| {
+                        let handle_conn = subconnector.and_then(move |subconn| {
+                            if let Ok(subconn_local_addr) = subconn.local_addr() {
+                                println!("Subconn port = {}", subconn_local_addr.port());
+                                source_address.borrow_mut().insert(subconn_local_addr.port(), incoming_addr);
+                            }
                             println!("Got subconn");
                             bipipe(tls_stream, subconn)
                         });
@@ -256,7 +267,51 @@ impl ServerStatus {
     
 }
 
-
+fn run_port_server(handle: Handle, server_status: Rc<RefCell<ServerStatus>>) {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 10030);
+    
+    let sock: TcpListener = if let Ok(sock) = TcpListener::bind(&addr, &handle) {
+            sock
+        } else {
+            println!("Unable to set up port_server on {:?}", addr);
+            return;
+        };
+        
+    let run = sock.incoming().for_each(move |(conn, _)| {
+        let server_status = server_status.clone();
+        println!("got a port query conn");
+        let xs = vec![0; 1024];
+        read(conn, xs)
+            .and_then(move |(stream, buf, read_len)| {
+                let buf = &buf[..read_len];
+                let url_start = buf.iter().position(|x| *x==b'/').map(|pos| pos+1);
+                let url_len = url_start.and_then(|start| buf[start..].iter().position(|x| *x==b' '));
+                let port_query = if let (Some(url_start), Some(url_len)) = (url_start, url_len) {
+                    str::from_utf8(&buf[url_start..url_start+url_len]).ok().and_then(|str| str.parse::<u16>().ok())
+                } else {
+                    None
+                };
+                
+                let (status_code, content) = if let Some(port_query) = port_query {
+                    println!("querying about port {}", port_query);
+                    let x = server_status.borrow();
+                    let y = x.source_address.borrow();
+                    let content = y.get(&port_query).map(|x| format!("{}", x.ip())).unwrap_or("?".to_string());
+                    
+                    ("200 OK", content)
+                } else {
+                    println!("bad request");
+                    ("400 Bad Request", "Use GET /1234".to_owned())
+                };
+                let response = format!("HTTP/1.0 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                    status_code, content.len(), content);
+                write_all(stream, response)
+            }).map(|_| ())
+    })
+    .map_err(|e| println!("Error running port_server: {:?}", e));
+    
+    handle.spawn(run);
+}
 
 fn main() {
     let (config, port_settings) = Config::new("config.json").expect("Config setup failed");
@@ -264,7 +319,7 @@ fn main() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     
-    let port_statuses = RefCell::new(ServerStatus::new(config.clone(), handle.clone()));
+    let port_statuses = Rc::new(RefCell::new(ServerStatus::new(config.clone(), handle.clone())));
     
     let interpret_port_settings = port_settings.for_each(|setting| {
         println!("port settings: {:?}", setting);
@@ -272,6 +327,8 @@ fn main() {
         port_statuses.borrow_mut().listen_on(&setting);
         Ok( () )
     });
+    
+    run_port_server(handle.clone(), port_statuses.clone());
     
     // Spin up the server on the event loop
     core.run(interpret_port_settings.map_err(|e| println!("interpret_port_settings failed: {:?}", e))).unwrap();
