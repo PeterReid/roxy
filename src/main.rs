@@ -19,6 +19,7 @@ use prefixed_writer::PrefixedWriter;
 use futures::{Future, Stream};
 
 use futures::sync::oneshot;
+use futures::future::Either;
 use tokio_tls::{TlsAcceptorExt};
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
@@ -106,6 +107,10 @@ struct ServerStatus {
     ports: HashMap<u16, PortStatus>
 }
 
+fn looks_like_http(x: &[u8]) -> bool {
+    x.iter().all(|b| *b>=0x20 && *b<=0x7e) 
+}
+
 impl ServerStatus {
     fn new(config: Config, handle: Handle) -> ServerStatus {
         ServerStatus {
@@ -128,47 +133,66 @@ impl ServerStatus {
             
             //let snied_stream = conn;//detect_hostname(conn);
             let f = read_exact(conn, [0u8; 5]);
-            let snied_stream = f.and_then(|(x, handshake_header)| {
-                let handshake_len = BigEndian::read_u16(&handshake_header[3..5]) as usize;
-
-                read_exact(x, vec![0u8; handshake_len]).map(move |(x, handshake_content)| {
-                    let mut both = vec![0u8; handshake_len + 5];
-                    both[0..5].copy_from_slice(&handshake_header[..]);;
-                    both[5..].copy_from_slice(&handshake_content[..]);
-                    
-                    let res = match get_host(&handshake_content[..]) {
-                        Ok(host) => host,
-                        Err( () ) => String::new(),
-                    };
-                    (res, PrefixedWriter::new(x, both.into_boxed_slice()))
-                })
-            });
-            
-            let handshaken_stream = snied_stream.and_then(move |(host, conn)| {
-                println!("Host is {}", host);
-                let input = Input{
-                    secure: true,
-                    port: port,
-                    host: host
-                };
-                println!("Lookingn for input: {:?}", input);
-                let output = config.get(&input).expect("Configuration for input not found");
-                
-                assert!(!output.secure);
-                (output.acceptor.accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.address))
-            });
-            
             let local_handle = handle.clone(); // This clone gets consumed by the tls_stream-handling closure
-            let do_stuff = handshaken_stream.and_then(move |(tls_stream, address)| {
-                println!("We have tls_stream");
-                
-                let subconnector = TcpStream::connect(&address, &local_handle);
-                let handle_conn = subconnector.and_then(|subconn| {
-                    println!("Got subconn");
-                    bipipe(tls_stream, subconn)
-                });
-                
-                handle_conn
+            
+            let do_stuff = f.and_then(move |(x, handshake_header)| {
+                if looks_like_http(&handshake_header[..]) {
+                    let input = Input{
+                        secure: false,
+                        port: port,
+                        host: "localproxy.flightvector.com".to_string()
+                    };
+                    
+                    let output = config.get(&input).expect("Configuration for input not found");
+                    
+                    let x = PrefixedWriter::new(x, handshake_header.to_vec().into_boxed_slice());
+                    let handle_http = 
+                        TcpStream::connect(&output.address, &local_handle)
+                        .and_then(|subconn| {
+                            println!("Got HTTP subconn");
+                            bipipe(x, subconn)
+                        });
+                    
+                    Either::A(handle_http)
+                } else {
+                    let handshake_len = BigEndian::read_u16(&handshake_header[3..5]) as usize;
+                    
+                    let handle_https = read_exact(x, vec![0u8; handshake_len]).map(move |(x, handshake_content)| {
+                        let mut both = vec![0u8; handshake_len + 5];
+                        both[0..5].copy_from_slice(&handshake_header[..]);;
+                        both[5..].copy_from_slice(&handshake_content[..]);
+                        
+                        let res = match get_host(&handshake_content[..]) {
+                            Ok(host) => host,
+                            Err( () ) => String::new(),
+                        };
+                        (res, PrefixedWriter::new(x, both.into_boxed_slice()))
+                    }).and_then(move |(host, conn)| {
+                        println!("Host is {}", host);
+                        let input = Input{
+                            secure: true,
+                            port: port,
+                            host: host
+                        };
+                        println!("Lookingn for input: {:?}", input);
+                        let output = config.get(&input).expect("Configuration for input not found");
+                        
+                        assert!(!output.secure);
+                        (output.acceptor.expect("Missing acceptor for secure input").accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.address))
+                    }).and_then(move |(tls_stream, address)| {
+                        println!("We have tls_stream");
+                        
+                        let subconnector = TcpStream::connect(&address, &local_handle);
+                        let handle_conn = subconnector.and_then(|subconn| {
+                            println!("Got subconn");
+                            bipipe(tls_stream, subconn)
+                        });
+                        
+                        handle_conn
+                    });
+                    
+                    Either::B(handle_https)
+                }
             });
             
             // Spawn expects things that return Item=(), Error=(), so consume them

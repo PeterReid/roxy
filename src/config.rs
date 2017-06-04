@@ -30,7 +30,7 @@ pub struct Input {
 
 #[derive(Clone)]
 pub struct Output {
-    pub acceptor: Arc<TlsAcceptor>,
+    pub acceptor: Option<Arc<TlsAcceptor>>,
     pub address: SocketAddr,
     pub secure: bool,
 }
@@ -84,7 +84,7 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx
         
         let incoming_url = Url::parse(incoming_url_str).map_err(|e| format!("Badly formatted host: {}\n{:?}", incoming_url_str, e))?;
         
-        let secure = match incoming_url.scheme() {
+        let incoming_secure = match incoming_url.scheme() {
             "http" => false,
             "https" => true,
             _ => {
@@ -93,10 +93,10 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx
         };
         
         let hostname = incoming_url.host_str().ok_or_else(|| format!("Missing host in {:?}", incoming_url_str))?;
-        let port = incoming_url.port().unwrap_or(if secure { 443 } else { 80 });
+        let port = incoming_url.port().unwrap_or(if incoming_secure { 443 } else { 80 });
         let input = Input {
             host: hostname.to_string(),
-            secure: secure,
+            secure: incoming_secure,
             port: port
         };
         
@@ -109,23 +109,34 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx
             let redirect = value.get("redirect").and_then(|x| x.as_str());
   
             match (pfx, target, redirect) {
-                  (Some(pfx), Some(target), None) => {
-                      let (address, secure) = parse_target(target).unwrap();
-            
+                  (Some(pfx), Some(target), None) if incoming_secure => {
+                      let (address, outgoing_secure) = parse_target(target).unwrap();
+                  
                       let mut file = File::open(pfx).unwrap();
                       let mut pkcs12 = vec![];
                       file.read_to_end(&mut pkcs12).unwrap();
                       let pkcs12 = Pkcs12::from_der(&pkcs12, "").unwrap();
                       let acceptor = TlsAcceptor::builder(pkcs12).unwrap().build().unwrap();
-
+                  
                       let output = Output{
-                          acceptor: Arc::new(acceptor),
+                          acceptor: Some(Arc::new(acceptor)),
                           address: address,
-                          secure: secure,
+                          secure: outgoing_secure,
                       };
                       
                       inputs.insert(input, output);
                   },
+                  (None, Some(target), None) if !incoming_secure => {
+                      let (address, outgoing_secure) = parse_target(target).unwrap();
+                      
+                      let output = Output{
+                          acceptor: None,
+                          address: address,
+                          secure: outgoing_secure,
+                      };
+                      
+                      inputs.insert(input, output);
+                  }
                   _ => {
                       println!("Confused by output");
                   }
