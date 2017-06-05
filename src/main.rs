@@ -22,6 +22,7 @@ use cutter::Cutter;
 
 use futures::sync::oneshot;
 use futures::future::Either;
+use futures::future::err;
 use tokio_tls::{TlsAcceptorExt};
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
@@ -181,9 +182,12 @@ impl ServerStatus {
                                     .and_then(|host| String::from_utf8(host.to_vec()).ok())
                                     .unwrap_or_else(|| "*".to_string())
                             };
-                            //println!("Input = {:?}", input);
                             
-                            let output = config.get(&input).expect("Configuration for input not found");
+                            let output = if let Some(output) = config.get(&input) {
+                                output
+                            } else {
+                                return Either::A(write_all(x, "HTTP/1.1 404 Not Found\r\n\r\nUnrecognized host").map(|_| ()))
+                            };
                             assert!(!output.acceptor.is_some());
                             let handle = match output.action {
                                 Action::Forward{address, secure} => {
@@ -208,7 +212,7 @@ impl ServerStatus {
                                     Either::B(write_all(x, response).map(|_| ()))
                                 }
                             };
-                            handle
+                            Either::B(handle)
                         }))
                 } else {
                     //println!("Looks like HTTPS");
@@ -232,43 +236,54 @@ impl ServerStatus {
                             host: host
                         };
                         //println!("Lookingn for input: {:?}", input);
-                        let output = config.get(&input).expect("Configuration for input not found");
+                        match config.get(&input) {
+                            Some(output) => {
                         
-                        (output.acceptor.expect("Missing acceptor for secure input").accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.action))
-                    }).and_then(move |(tls_stream, action)| {
-                        //println!("We have tls_stream");
-                        let handle_conn = match action {
-                            Action::Forward{address, secure} => {
-                                assert!(!secure);
-                                let subconnector = TcpStream::connect(&address, &local_handle);
-                                let handle_conn = subconnector.and_then(move |subconn| {
-                                    if let Ok(subconn_local_addr) = subconn.local_addr() {
-                                        //println!("Subconn port = {}", subconn_local_addr.port());
-                                        source_address.borrow_mut().insert(subconn_local_addr.port(), incoming_addr);
-                                    }
-                                    //println!("Got subconn");
-                                    bipipe(tls_stream, subconn)
-                                });
-                                Either::A(handle_conn.map(|_| ()))
+                                let action = output.action;
+                                Either::A(output.acceptor.expect("Missing acceptor for secure input").accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e))
+                                    .and_then(move |tls_stream| {
+                              
+                                        //println!("We have tls_stream");
+                                        let handle_conn = match action {
+                                            Action::Forward{address, secure} => {
+                                                assert!(!secure);
+                                                let subconnector = TcpStream::connect(&address, &local_handle);
+                                                let handle_conn = subconnector.and_then(move |subconn| {
+                                                    if let Ok(subconn_local_addr) = subconn.local_addr() {
+                                                        //println!("Subconn port = {}", subconn_local_addr.port());
+                                                        source_address.borrow_mut().insert(subconn_local_addr.port(), incoming_addr);
+                                                    }
+                                                    //println!("Got subconn");
+                                                    bipipe(tls_stream, subconn)
+                                                });
+                                                Either::A(handle_conn.map(|_| ()))
+                                            }
+                                            Action::Redirect{redirect_to} => {
+                                                let cutter = Cutter::new(tls_stream, Vec::new())
+                                                    .and_then(move |(http_header, x)| {
+                                                        let path = get_between(&http_header, b" ", b" ").unwrap_or(b"/");
+                                                        let mut response = Vec::with_capacity(60 + redirect_to.len() + path.len());
+                                                        response.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nLocation: ");
+                                                        response.extend_from_slice(redirect_to.as_bytes());
+                                                        response.extend_from_slice(path);
+                                                        response.extend_from_slice(b"\r\n\r\n");
+                                                        
+                                                        write_all(x, response)
+                                                    });
+                                                Either::B(cutter.map(|_| ()))
+                                            }
+                                        };
+                                        handle_conn
+                                    }))
+
+                        
                             }
-                            Action::Redirect{redirect_to} => {
-                                let cutter = Cutter::new(tls_stream, Vec::new())
-                                    .and_then(move |(http_header, x)| {
-                                        let path = get_between(&http_header, b" ", b" ").unwrap_or(b"/");
-                                        let mut response = Vec::with_capacity(60 + redirect_to.len() + path.len());
-                                        response.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nLocation: ");
-                                        response.extend_from_slice(redirect_to.as_bytes());
-                                        response.extend_from_slice(path);
-                                        response.extend_from_slice(b"\r\n\r\n");
-                                        
-                                        write_all(x, response)
-                                    });
-                                Either::B(cutter.map(|_| ()))
+                            None => {
+                                Either::B(err(io::Error::new(ErrorKind::Other, "Unrecognized HTTPS host")))
                             }
-                        };
-                        handle_conn
+                        }
+                        
                     });
-                    
                     Either::B(handle_https)
                 }
             });
@@ -346,7 +361,7 @@ fn run_port_server(handle: Handle, server_status: Rc<RefCell<ServerStatus>>) {
         
     let run = sock.incoming().for_each(move |(conn, _)| {
         let server_status = server_status.clone();
-        println!("got a port query conn");
+        //println!("got a port query conn");
         let xs = vec![0; 1024];
         read(conn, xs)
             .and_then(move |(stream, buf, read_len)| {
@@ -360,7 +375,7 @@ fn run_port_server(handle: Handle, server_status: Rc<RefCell<ServerStatus>>) {
                 };
                 
                 let (status_code, content) = if let Some(port_query) = port_query {
-                    println!("querying about port {}", port_query);
+                    //println!("querying about port {}", port_query);
                     let x = server_status.borrow();
                     let y = x.source_address.borrow();
                     let content = y.get(&port_query).map(|x| format!("{}", x.ip())).unwrap_or("?".to_string());

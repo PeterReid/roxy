@@ -100,9 +100,11 @@ fn process_config_item(incoming_url_str: &str, value: &JsonValue) -> Result<(Por
         let acceptor = if let Some(pfx) = pfx {
             let mut file = File::open(pfx).map_err(|e| format!("Unable to open PFX file (specified as {:?}): {:?}", pfx, e))?;
             let mut pkcs12 = vec![];
-            file.read_to_end(&mut pkcs12).unwrap();
-            let pkcs12 = Pkcs12::from_der(&pkcs12, "").unwrap();
-            Some(Arc::new(TlsAcceptor::builder(pkcs12).unwrap().build().unwrap()))
+            file.read_to_end(&mut pkcs12).map_err(|e| format!("Unable to read PFX file: {:?}", e))?;
+            let pkcs12 = Pkcs12::from_der(&pkcs12, "").map_err(|e| format!("Malformed PFX file at {:?}: {:?}", pfx, e))?;
+            Some(Arc::new(
+                TlsAcceptor::builder(pkcs12).map_err(|e| format!("Unable to create TLS acceptor from PFX: {:?}", e))?
+                .build().map_err(|e| format!("Failed to build TLS acceptor: {:?}", e))?))
         } else {
             None
         };
@@ -140,9 +142,10 @@ fn process_config_item(incoming_url_str: &str, value: &JsonValue) -> Result<(Por
 fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx: FutureSender<BTreeSet<Port>>) -> Result<(), String> {
     let mut bytes = Vec::new();
     
-    File::open(path).unwrap().read_to_end(&mut bytes).unwrap();
+    File::open(path).map_err(|e| format!("Unable to open configuration file from {:?}: {:?}", path, e))?
+        .read_to_end(&mut bytes).map_err(|e| format!("Unable to read configuration file from {:?}: {:?}", path, e))?;
     
-    let json_str = String::from_utf8(bytes).unwrap();
+    let json_str = String::from_utf8(bytes).map_err(|e| format!("Configuration file was not UTF8-encoded: {:?}", e))?;
     let json_ob = json::parse(&json_str).map_err(|e| format!("Configuration file JSON parse failed: {:?}", e))?;
     
     let json_ob = if let JsonValue::Object(json_ob) = json_ob { json_ob } else {
@@ -166,7 +169,7 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx
         }
     }
 
-    *data.lock().expect("config lock failed")= inputs;
+    *data.lock().expect("configuration lock poisoned") = inputs;
     
     let mut core = Core::new().map_err(|e| format!("Internal error: Unable to initialize Core for port configuration send: {:?}", e))?;
     core.run(port_config_tx.send(listen_ports)).map_err(|e| format!("Internal error running port configuration send: {:?}", e))?;
