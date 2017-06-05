@@ -29,10 +29,15 @@ pub struct Input {
 }
 
 #[derive(Clone)]
+pub enum Action{
+    Forward{address: SocketAddr, secure: bool},
+    Redirect{redirect_to: String},
+}
+
+#[derive(Clone)]
 pub struct Output {
     pub acceptor: Option<Arc<TlsAcceptor>>,
-    pub address: SocketAddr,
-    pub secure: bool,
+    pub action: Action,
 }
 
 #[derive(Clone)]
@@ -64,6 +69,74 @@ fn parse_target(target: &str) -> Result<(SocketAddr, bool), String> {
     Ok((dest, secure))
 }
 
+fn process_config_item(incoming_url_str: &str, value: &JsonValue) -> Result<(Port, Input, Output), String> {
+    let incoming_url = Url::parse(incoming_url_str).map_err(|e| format!("Badly formatted host: {}\n{:?}", incoming_url_str, e))?;
+    
+    let incoming_secure = match incoming_url.scheme() {
+        "http" => false,
+        "https" => true,
+        _ => {
+            return Err(format!("Invalid scheme {:?} in URL: {:?}", incoming_url.scheme(), incoming_url_str));
+        }
+    };
+    
+    let hostname = incoming_url.host_str().ok_or_else(|| format!("Missing host in {:?}", incoming_url_str))?;
+    let port = incoming_url.port().unwrap_or(if incoming_secure { 443 } else { 80 });
+    let input = Input {
+        host: hostname.to_string(),
+        secure: incoming_secure,
+        port: port
+    };
+    
+    if let JsonValue::Object(ref value) = *value {
+        let pfx = value.get("pfx").and_then(|x| x.as_str());
+        let target = value.get("target").and_then(|x| x.as_str());
+        let redirect = value.get("redirect").and_then(|x| x.as_str());
+
+        if pfx.is_some() != incoming_secure {
+            return Err(format!("PFX should be specified only if the incoming connection is HTTPS."));
+        }
+        
+        let acceptor = if let Some(pfx) = pfx {
+            let mut file = File::open(pfx).map_err(|e| format!("Unable to open PFX file (specified as {:?}): {:?}", pfx, e))?;
+            let mut pkcs12 = vec![];
+            file.read_to_end(&mut pkcs12).unwrap();
+            let pkcs12 = Pkcs12::from_der(&pkcs12, "").unwrap();
+            Some(Arc::new(TlsAcceptor::builder(pkcs12).unwrap().build().unwrap()))
+        } else {
+            None
+        };
+
+        let action = match (target, redirect) {
+              (Some(target), None) => {
+                  let (address, outgoing_secure) = parse_target(target)?;
+                  Action::Forward{
+                      address: address,
+                      secure: outgoing_secure,
+                  }
+              },
+              (None, Some(redirect)) => {
+                  Action::Redirect{
+                      redirect_to: redirect.to_string()
+                  }
+              },
+              _ => {
+                 return Err("Confused by output".to_string());
+              }
+        };
+        
+        let output = Output{
+            acceptor: acceptor,
+            action: action
+        };
+        
+        Ok((port, input, output))
+    } else {
+        Err("Instructions should be a JSON object".to_string())
+    }
+
+}
+
 fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx: FutureSender<BTreeSet<Port>>) -> Result<(), String> {
     let mut bytes = Vec::new();
     
@@ -81,75 +154,20 @@ fn load_config(path: &Path, data: &Mutex<HashMap<Input, Output>>, port_config_tx
     let mut listen_ports = BTreeSet::new();
     
     for (incoming_url_str, value) in json_ob.iter() {
-        
-        let incoming_url = Url::parse(incoming_url_str).map_err(|e| format!("Badly formatted host: {}\n{:?}", incoming_url_str, e))?;
-        
-        let incoming_secure = match incoming_url.scheme() {
-            "http" => false,
-            "https" => true,
-            _ => {
-                return Err(format!("Invalid scheme {:?} in URL: {:?}", incoming_url.scheme(), incoming_url_str));
+        match process_config_item(incoming_url_str, value) {
+            Ok( (port, input, output) ) => {
+                println!("Processed rule for {}", incoming_url_str);
+                inputs.insert(input, output);
+                listen_ports.insert(port);
             }
-        };
-        
-        let hostname = incoming_url.host_str().ok_or_else(|| format!("Missing host in {:?}", incoming_url_str))?;
-        let port = incoming_url.port().unwrap_or(if incoming_secure { 443 } else { 80 });
-        let input = Input {
-            host: hostname.to_string(),
-            secure: incoming_secure,
-            port: port
-        };
-        
-        listen_ports.insert(port);
-        
-        println!("{:?}", input);
-        if let JsonValue::Object(ref value) = *value {
-            let pfx = value.get("pfx").and_then(|x| x.as_str());
-            let target = value.get("target").and_then(|x| x.as_str());
-            let redirect = value.get("redirect").and_then(|x| x.as_str());
-  
-            match (pfx, target, redirect) {
-                  (Some(pfx), Some(target), None) if incoming_secure => {
-                      let (address, outgoing_secure) = parse_target(target).unwrap();
-                  
-                      let mut file = File::open(pfx).unwrap();
-                      let mut pkcs12 = vec![];
-                      file.read_to_end(&mut pkcs12).unwrap();
-                      let pkcs12 = Pkcs12::from_der(&pkcs12, "").unwrap();
-                      let acceptor = TlsAcceptor::builder(pkcs12).unwrap().build().unwrap();
-                  
-                      let output = Output{
-                          acceptor: Some(Arc::new(acceptor)),
-                          address: address,
-                          secure: outgoing_secure,
-                      };
-                      
-                      inputs.insert(input, output);
-                  },
-                  (None, Some(target), None) if !incoming_secure => {
-                      let (address, outgoing_secure) = parse_target(target).unwrap();
-                      
-                      let output = Output{
-                          acceptor: None,
-                          address: address,
-                          secure: outgoing_secure,
-                      };
-                      
-                      inputs.insert(input, output);
-                  }
-                  _ => {
-                      println!("Confused by output");
-                  }
+            Err(e) => {
+                println!("Error processing rules for {:?}: {}", incoming_url_str, e);
             }
         }
     }
 
     *data.lock().expect("config lock failed")= inputs;
     
-    
-    
-    
- 
     let mut core = Core::new().map_err(|e| format!("Internal error: Unable to initialize Core for port configuration send: {:?}", e))?;
     core.run(port_config_tx.send(listen_ports)).map_err(|e| format!("Internal error running port configuration send: {:?}", e))?;
     

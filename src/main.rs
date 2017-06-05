@@ -12,11 +12,13 @@ extern crate bytes;
 mod config;
 mod copy_and_yield;
 mod prefixed_writer;
+mod cutter;
 
 use copy_and_yield::bipipe;
 use prefixed_writer::PrefixedWriter;
 
 use futures::{Future, Stream};
+use cutter::Cutter;
 
 use futures::sync::oneshot;
 use futures::future::Either;
@@ -32,7 +34,7 @@ use tokio_io::io::read;
 use tokio_io::io::write_all;
 use std::str;
 use byteorder::{BigEndian, ByteOrder};
-use config::{Config, Input};
+use config::{Config, Input, Action};
 use std::cell::RefCell;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -115,6 +117,28 @@ fn looks_like_http(x: &[u8]) -> bool {
     x.iter().all(|b| *b>=0x20 && *b<=0x7e) 
 }
 
+
+fn get_between<'a>(haystack: &'a [u8], prefix: &[u8], suffix: &[u8]) -> Option<&'a [u8]> {
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|window| window == needle)
+    }
+
+    let prefix_pos = if let Some(prefix_pos) = find(haystack, prefix) {
+        prefix_pos
+    } else {
+        return None;
+    };
+    
+    let haystack = &haystack[prefix_pos + prefix.len()..];
+    let between_len = if let Some(between_len) = find(haystack, suffix) {
+        between_len
+    } else {
+        return None;
+    };
+    
+    Some(&haystack[..between_len])
+}
+
 impl ServerStatus {
     fn new(config: Config, handle: Handle) -> ServerStatus {
         ServerStatus {
@@ -135,7 +159,7 @@ impl ServerStatus {
         let sock: TcpListener = TcpListener::bind(&addr, &handle)?;
         let server = sock.incoming().for_each(move |(conn, incoming_addr)| {
             let source_address = source_address.clone();
-            println!("Incoming connection from {:?}", incoming_addr);
+            //println!("Incoming connection from {:?}", incoming_addr);
             let config = config.clone();
             
             //let snied_stream = conn;//detect_hostname(conn);
@@ -144,24 +168,50 @@ impl ServerStatus {
             
             let do_stuff = f.and_then(move |(x, handshake_header)| {
                 if looks_like_http(&handshake_header[..]) {
-                    let input = Input{
-                        secure: false,
-                        port: port,
-                        host: "localproxy.flightvector.com".to_string()
-                    };
-                    
-                    let output = config.get(&input).expect("Configuration for input not found");
-                    
-                    let x = PrefixedWriter::new(x, handshake_header.to_vec().into_boxed_slice());
-                    let handle_http = 
-                        TcpStream::connect(&output.address, &local_handle)
-                        .and_then(|subconn| {
-                            println!("Got HTTP subconn");
-                            bipipe(x, subconn)
-                        });
-                    
-                    Either::A(handle_http)
+                    //println!("Looks like HTTP");
+                    Either::A(Cutter::new(x, handshake_header.to_vec())
+                        .and_then(move |(http_header, x)| {
+                            //println!("Got HTTP header: {:?}", str::from_utf8(&http_header));
+                            
+                            //let path = get_between(http_header, b"\r\nHost: ", b"\r\n");
+                            let input = Input{
+                                secure: false,
+                                port: port,
+                                host: get_between(&http_header, b"\r\nHost: ", b"\r\n")
+                                    .and_then(|host| String::from_utf8(host.to_vec()).ok())
+                                    .unwrap_or_else(|| "*".to_string())
+                            };
+                            //println!("Input = {:?}", input);
+                            
+                            let output = config.get(&input).expect("Configuration for input not found");
+                            assert!(!output.acceptor.is_some());
+                            let handle = match output.action {
+                                Action::Forward{address, secure} => {
+                                    assert!(!secure);
+                                    let x = PrefixedWriter::new(x, http_header.into_boxed_slice());
+                                    let handle_http = 
+                                        TcpStream::connect(&address, &local_handle)
+                                        .and_then(|subconn| {
+                                            //println!("Got HTTP subconn");
+                                            bipipe(x, subconn)
+                                        });
+                                    Either::A(handle_http)
+                                }
+                                Action::Redirect{redirect_to} => {
+                                    let path = get_between(&http_header, b" ", b" ").unwrap_or(b"/");
+                                    let mut response = Vec::with_capacity(60 + redirect_to.len() + path.len());
+                                    response.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nLocation: ");
+                                    response.extend_from_slice(redirect_to.as_bytes());
+                                    response.extend_from_slice(path);
+                                    response.extend_from_slice(b"\r\n\r\n");
+                                    
+                                    Either::B(write_all(x, response).map(|_| ()))
+                                }
+                            };
+                            handle
+                        }))
                 } else {
+                    //println!("Looks like HTTPS");
                     let handshake_len = BigEndian::read_u16(&handshake_header[3..5]) as usize;
                     
                     let handle_https = read_exact(x, vec![0u8; handshake_len]).map(move |(x, handshake_content)| {
@@ -175,30 +225,47 @@ impl ServerStatus {
                         };
                         (res, PrefixedWriter::new(x, both.into_boxed_slice()))
                     }).and_then(move |(host, conn)| {
-                        println!("Host is {}", host);
+                        //println!("Host is {}", host);
                         let input = Input{
                             secure: true,
                             port: port,
                             host: host
                         };
-                        println!("Lookingn for input: {:?}", input);
+                        //println!("Lookingn for input: {:?}", input);
                         let output = config.get(&input).expect("Configuration for input not found");
                         
-                        assert!(!output.secure);
-                        (output.acceptor.expect("Missing acceptor for secure input").accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.address))
-                    }).and_then(move |(tls_stream, address)| {
-                        println!("We have tls_stream");
-                        
-                        let subconnector = TcpStream::connect(&address, &local_handle);
-                        let handle_conn = subconnector.and_then(move |subconn| {
-                            if let Ok(subconn_local_addr) = subconn.local_addr() {
-                                println!("Subconn port = {}", subconn_local_addr.port());
-                                source_address.borrow_mut().insert(subconn_local_addr.port(), incoming_addr);
+                        (output.acceptor.expect("Missing acceptor for secure input").accept_async(conn).map_err(|e| io::Error::new(ErrorKind::Other, e)), Ok(output.action))
+                    }).and_then(move |(tls_stream, action)| {
+                        //println!("We have tls_stream");
+                        let handle_conn = match action {
+                            Action::Forward{address, secure} => {
+                                assert!(!secure);
+                                let subconnector = TcpStream::connect(&address, &local_handle);
+                                let handle_conn = subconnector.and_then(move |subconn| {
+                                    if let Ok(subconn_local_addr) = subconn.local_addr() {
+                                        //println!("Subconn port = {}", subconn_local_addr.port());
+                                        source_address.borrow_mut().insert(subconn_local_addr.port(), incoming_addr);
+                                    }
+                                    //println!("Got subconn");
+                                    bipipe(tls_stream, subconn)
+                                });
+                                Either::A(handle_conn.map(|_| ()))
                             }
-                            println!("Got subconn");
-                            bipipe(tls_stream, subconn)
-                        });
-                        
+                            Action::Redirect{redirect_to} => {
+                                let cutter = Cutter::new(tls_stream, Vec::new())
+                                    .and_then(move |(http_header, x)| {
+                                        let path = get_between(&http_header, b" ", b" ").unwrap_or(b"/");
+                                        let mut response = Vec::with_capacity(60 + redirect_to.len() + path.len());
+                                        response.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nLocation: ");
+                                        response.extend_from_slice(redirect_to.as_bytes());
+                                        response.extend_from_slice(path);
+                                        response.extend_from_slice(b"\r\n\r\n");
+                                        
+                                        write_all(x, response)
+                                    });
+                                Either::B(cutter.map(|_| ()))
+                            }
+                        };
                         handle_conn
                     });
                     
@@ -207,7 +274,7 @@ impl ServerStatus {
             });
             
             // Spawn expects things that return Item=(), Error=(), so consume them
-            let do_stuff = do_stuff.map(|_| println!("got to end of the conn future!")).map_err(|e| println!("Got error! {:?}", e));
+            let do_stuff = do_stuff.map(|_| ()).map_err(|e| println!("Got error! {:?}", e));
             
             // Spawn the future as a concurrent task
             handle.spawn(do_stuff);
