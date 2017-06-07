@@ -1,5 +1,5 @@
 [package]
-name = "tls_user"
+name = "roxy"
 version = "0.1.0"
 authors = ["Peter Reid <peter.d.reid@gmail.com>"]
 
@@ -7,10 +7,10 @@ authors = ["Peter Reid <peter.d.reid@gmail.com>"]
 native-tls = "0.1.1"
 tokio-tls = "0.1.2"
 tokio-core = "0.1.7"
-tokio-io = "*"
+tokio-io = "0.1.2"
 futures = "0.1.14"
 byteorder = "1.0.0"
 notify = "4.0.0"
 json = "0.11.6"
 url = "1.4.1"
-bytes = "*"
+bytes = "0.4.4"

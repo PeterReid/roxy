@@ -32,7 +32,9 @@ impl<S: Read> AsyncRead for PrefixedWriter<S> {
 
 
 impl<S: AsyncWrite> AsyncWrite for PrefixedWriter<S> {
-    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
+    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error>
+        where Self: Sized {
+        
         self.inner.write_buf(buf)
     }
     
