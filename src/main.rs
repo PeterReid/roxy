@@ -140,6 +140,13 @@ fn get_between<'a>(haystack: &'a [u8], prefix: &[u8], suffix: &[u8]) -> Option<&
     Some(&haystack[..between_len])
 }
 
+fn before_colon(x: &str) -> &str {
+    match x.find(':') {
+        None => x,
+        Some(colon_idx) => &x[..colon_idx]
+    }
+}
+
 impl ServerStatus {
     fn new(config: Config, handle: Handle) -> ServerStatus {
         ServerStatus {
@@ -174,12 +181,13 @@ impl ServerStatus {
                         .and_then(move |(http_header, x)| {
                             //println!("Got HTTP header: {:?}", str::from_utf8(&http_header));
                             
-                            //let path = get_between(http_header, b"\r\nHost: ", b"\r\n");
                             let input = Input{
                                 secure: false,
                                 port: port,
                                 host: get_between(&http_header, b"\r\nHost: ", b"\r\n")
-                                    .and_then(|host| String::from_utf8(host.to_vec()).ok())
+                                    .and_then(|host| str::from_utf8(host).ok())
+                                    .map(before_colon)
+                                    .map(str::to_owned)
                                     .unwrap_or_else(|| "*".to_string())
                             };
                             
