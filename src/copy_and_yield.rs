@@ -76,7 +76,7 @@ impl<A: AsyncWrite, B: AsyncWrite> BiPipe<A, B> {
     fn close_both(&mut self) -> Poll<(), io::Error> {
         let err1 = self.a.shutdown();
         let err2 = self.b.shutdown();
-        try!(err1);
+        err1?;
         err2
     }
 }

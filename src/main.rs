@@ -80,23 +80,23 @@ fn u16_chunk(xs: &[u8]) -> Result<(&[u8], &[u8]), ()> {
 
 
 fn get_host(handshake: &[u8]) -> Result<String, ()> {
-    let remainder = try!(cut_prefix(handshake, 2));
-    let (remainder, _) = try!(u16_chunk(remainder));
+    let remainder = cut_prefix(handshake, 2)?;
+    let (remainder, _) = u16_chunk(remainder)?;
     let version_skip = 2;
     let random_skip = 32;
-    let remainder = try!(cut_prefix(remainder, version_skip + random_skip));
-    let (_session, remainder) = try!(u8_chunk(remainder));
-    let (_ciphers, remainder) = try!(u16_chunk(remainder));
-    let (_compression_methods, remainder) = try!(u8_chunk(remainder));
-    let (extensions, _) = try!(u16_chunk(remainder));
+    let remainder = cut_prefix(remainder, version_skip + random_skip)?;
+    let (_session, remainder) = u8_chunk(remainder)?;
+    let (_ciphers, remainder) = u16_chunk(remainder)?;
+    let (_compression_methods, remainder) = u8_chunk(remainder)?;
+    let (extensions, _) = u16_chunk(remainder)?;
     let mut extensions = extensions;
     while extensions.len() > 4 {
         let type_code = BigEndian::read_u16(&extensions[0..2]);
-        let (this_extension, other_extensions) = try!(u16_chunk(&extensions[2..]));
+        let (this_extension, other_extensions) = u16_chunk(&extensions[2..])?;
         if type_code == 0 {
-            let (sni_header, _) = try!(u16_chunk(this_extension));
-            let sni_header = try!(cut_prefix(sni_header, 1));
-            let (host_name, _) = try!(u16_chunk(sni_header));
+            let (sni_header, _) = u16_chunk(this_extension)?;
+            let sni_header = cut_prefix(sni_header, 1)?;
+            let (host_name, _) = u16_chunk(sni_header)?;
             return String::from_utf8(host_name.to_vec()).map_err(|_| ());
         }
         extensions = other_extensions;
@@ -229,7 +229,6 @@ impl ServerStatus {
                                     let redirect_root = b"/.well-known/acme-challenge/";
                                     let mut response;
                                     if path.len() > redirect_root.len() && &path[..redirect_root.len()] == &redirect_root[..] {
-                                        println!("Do a static file instead!");
                                         // TODO: Make this async
                                         if let Some(content) = read_acme_challenge(&path[redirect_root.len()..]) {
                                             response = Vec::with_capacity(80 + content.len());
@@ -257,7 +256,7 @@ impl ServerStatus {
                     
                     let handle_https = read_exact(x, vec![0u8; handshake_len]).map(move |(x, handshake_content)| {
                         let mut both = vec![0u8; handshake_len + 5];
-                        both[0..5].copy_from_slice(&handshake_header[..]);;
+                        both[0..5].copy_from_slice(&handshake_header[..]);
                         both[5..].copy_from_slice(&handshake_content[..]);
                         
                         let res = match get_host(&handshake_content[..]) {
