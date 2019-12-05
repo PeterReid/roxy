@@ -42,6 +42,8 @@ use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
+use std::io::Read;
+
 fn cut_prefix(xs: &[u8], cut: usize) -> Result<&[u8], ()> {
     if cut < xs.len() {
         Ok(&xs[cut..])
@@ -146,6 +148,19 @@ fn before_colon(x: &str) -> &str {
         Some(colon_idx) => &x[..colon_idx]
     }
 }
+fn read_acme_challenge(path: &[u8]) -> Option<Vec<u8>> {
+    let mut content = Vec::new();
+    let path_extension = String::from_utf8(path.to_vec()).ok()?;
+    
+    if path_extension.find('/').is_some() {
+        return None;
+    }
+    
+    
+    let mut f = std::fs::File::open(format!(".well-known/acme-challenge/{}", path_extension)).ok()?;
+    f.read_to_end(&mut content).ok()?;
+    Some(content)
+}
 
 impl ServerStatus {
     fn new(config: Config, handle: Handle) -> ServerStatus {
@@ -211,12 +226,26 @@ impl ServerStatus {
                                 }
                                 Action::Redirect{redirect_to} => {
                                     let path = get_between(&http_header, b" ", b" ").unwrap_or(b"/");
-                                    let mut response = Vec::with_capacity(60 + redirect_to.len() + path.len());
-                                    response.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nLocation: ");
-                                    response.extend_from_slice(redirect_to.as_bytes());
-                                    response.extend_from_slice(path);
-                                    response.extend_from_slice(b"\r\n\r\n");
-                                    
+                                    let redirect_root = b"/.well-known/acme-challenge/";
+                                    let mut response;
+                                    if path.len() > redirect_root.len() && &path[..redirect_root.len()] == &redirect_root[..] {
+                                        println!("Do a static file instead!");
+                                        // TODO: Make this async
+                                        if let Some(content) = read_acme_challenge(&path[redirect_root.len()..]) {
+                                            response = Vec::with_capacity(80 + content.len());
+                                            response.extend_from_slice(format!("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n", content.len()).as_bytes());
+                                            response.extend_from_slice(&content);
+                                        } else {
+                                            response = b"HTTP/1.0 404 Not found\r\n\r\nNot found".to_vec();
+                                        }
+                                    } else {
+                                        response = Vec::with_capacity(60 + redirect_to.len() + path.len());
+                                        response.extend_from_slice(b"HTTP/1.1 301 Moved Permanently\r\nLocation: ");
+                                        response.extend_from_slice(redirect_to.as_bytes());
+                                        response.extend_from_slice(path);
+                                        response.extend_from_slice(b"\r\n\r\n");
+                                        
+                                    }
                                     Either::B(write_all(x, response).map(|_| ()))
                                 }
                             };
@@ -287,7 +316,7 @@ impl ServerStatus {
                         
                             }
                             None => {
-                                Either::B(err(io::Error::new(ErrorKind::Other, "Unrecognized HTTPS host")))
+                                Either::B(err(io::Error::new(ErrorKind::Other, format!("Unrecognized HTTPS host: {}:{}", input.host, port))))
                             }
                         }
                         
